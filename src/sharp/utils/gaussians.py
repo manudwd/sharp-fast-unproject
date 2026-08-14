@@ -91,29 +91,78 @@ def unproject_gaussians(
     extrinsics: torch.Tensor,
     intrinsics: torch.Tensor,
     image_shape: tuple[int, int],
+    *,
+    means_only: bool = False,
 ) -> Gaussians3D:
-    """Unproject Gaussians from NDC space to world coordinates."""
+    """Unproject Gaussians from NDC space to world coordinates.
+
+    Args:
+        means_only: If True, transform mean vectors only and pass through
+            NDC quaternions/scales. Use when the consumer needs metric means,
+            colors, and opacities but not metric ellipsoids (point/LOD viewers,
+            depth lift). Omits the CPU fp64 covariance SVD in ``apply_transform``.
+            Do not use with gsplat rendering that requires metric covariances.
+    """
     unprojection_matrix = get_unprojection_matrix(extrinsics, intrinsics, image_shape)
-    gaussians = apply_transform(gaussians_ndc, unprojection_matrix[:3])
+    gaussians = apply_transform(
+        gaussians_ndc, unprojection_matrix[:3], means_only=means_only
+    )
     return gaussians
 
 
-def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
+def unproject_gaussian_means(
+    means_ndc: torch.Tensor,
+    extrinsics: torch.Tensor,
+    intrinsics: torch.Tensor,
+    image_shape: tuple[int, int],
+) -> torch.Tensor:
+    """Map NDC Gaussian means to Euclidean space (no covariance work).
+
+    Time ``O(N)`` GPU affine. Matches ``unproject_gaussians(...).mean_vectors``
+    within float32 roundoff for the same inputs.
+    """
+    matrix = get_unprojection_matrix(extrinsics, intrinsics, image_shape)[:3]
+    linear = matrix[..., :3, :3]
+    offset = matrix[..., :3, 3]
+    return means_ndc @ linear.T + offset
+
+
+def apply_transform(
+    gaussians: Gaussians3D,
+    transform: torch.Tensor,
+    *,
+    means_only: bool = False,
+) -> Gaussians3D:
     """Apply an affine transformation to 3D Gaussians.
 
     Args:
         gaussians: The Gaussians to transform.
         transform: An affine transform with shape 3x4.
+        means_only: Skip compose/SVD of covariances. Means match the full path;
+            quaternions and singular_values are returned unchanged (still NDC).
 
     Returns:
         The transformed Gaussians.
 
     Note: This operation is not differentiable.
+
+    Complexity:
+        Full path: ``O(N)`` GPU mean affine + ``O(N)`` CPU fp64 3x3 SVD.
+        Means-only: ``O(N)`` GPU mean affine; no SVD, no host cov buffers.
     """
     transform_linear = transform[..., :3, :3]
     transform_offset = transform[..., :3, 3]
 
     mean_vectors = gaussians.mean_vectors @ transform_linear.T + transform_offset
+    if means_only:
+        return Gaussians3D(
+            mean_vectors=mean_vectors,
+            singular_values=gaussians.singular_values,
+            quaternions=gaussians.quaternions,
+            colors=gaussians.colors,
+            opacities=gaussians.opacities,
+        )
+
     covariance_matrices = compose_covariance_matrices(
         gaussians.quaternions, gaussians.singular_values
     )

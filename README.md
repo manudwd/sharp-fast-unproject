@@ -1,3 +1,38 @@
+# Fast Means-Only Metric Unprojection for Apple SHARP
+
+Apple [SHARP](https://github.com/apple-aiml-research/ml-sharp) regresses ~1.2M
+metric 3D Gaussians from a single image. After the neural forward, upstream
+unprojection always rebuilds every ellipsoid with a **host `float64` 3×3 SVD**
+(`decompose_covariance_matrices`: `.cpu().to(torch.float64)` → `linalg.svd`).
+That work is mandatory even when the next stage only needs **means, colors, and
+opacities** — point clouds, depth lift, LOD viewers — and Apple ships **no GPU
+or means-only bypass**.
+
+This repository adds that path: keep the SHARP predictor unchanged; replace the
+covariance SVD with an **O(N) device affine on means**. Means match the full
+upstream unproject; ellipsoids are omitted on purpose.
+
+| Path | Unproject cost | Retained fields |
+| --- | --- | --- |
+| Upstream full | O(N) mean affine + **O(N) CPU fp64 SVD** | means, scales, quats, colors, opacities |
+| **`--means-only` (this work)** | **O(N) device affine on means** | means, colors, opacities |
+
+![Full SVD unproject vs means-only wall time](docs/bench_means_only.png)
+
+```bash
+sharp predict -i images/ -o out/ --means-only
+
+# Regenerates docs/bench_means_only.png
+python benchmarks/bench_means_only_unproject.py --n 300000 1180000 --device cpu
+```
+
+API: `unproject_gaussians(..., means_only=True)`, `unproject_gaussian_means(...)`.
+Do not combine `--means-only` with `--render` (metric covariances required for
+gsplat). Based on [apple-aiml-research/ml-sharp](https://github.com/apple-aiml-research/ml-sharp);
+Apple LICENSE / LICENSE_MODEL still apply.
+
+---
+
 # Sharp Monocular View Synthesis in Less Than a Second
 
 [![Project Page](https://img.shields.io/badge/Project-Page-green)](https://apple.github.io/ml-sharp/)

@@ -72,6 +72,17 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     default="default",
     help="Device to run on. ['cpu', 'mps', 'cuda']",
 )
+@click.option(
+    "--means-only/--full-unproject",
+    "means_only",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip CPU fp64 covariance SVD during metric unproject. "
+        "Means/colors/opacities are valid; ellipsoids stay NDC. "
+        "Incompatible with --render."
+    ),
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
 def predict_cli(
     input_path: Path,
@@ -79,10 +90,13 @@ def predict_cli(
     checkpoint_path: Path,
     with_rendering: bool,
     device: str,
+    means_only: bool,
     verbose: bool,
 ):
     """Predict Gaussians from input images."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
+    if means_only and with_rendering:
+        raise click.UsageError("--means-only cannot be combined with --render")
 
     extensions = io.get_supported_image_extensions()
 
@@ -142,7 +156,13 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
-        gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
+        gaussians = predict_image(
+            gaussian_predictor,
+            image,
+            f_px,
+            torch.device(device),
+            means_only=means_only,
+        )
 
         LOGGER.info("Saving 3DGS to %s", output_path)
         save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
@@ -161,6 +181,8 @@ def predict_image(
     image: np.ndarray,
     f_px: float,
     device: torch.device,
+    *,
+    means_only: bool = False,
 ) -> Gaussians3D:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
@@ -181,7 +203,7 @@ def predict_image(
     LOGGER.info("Running inference.")
     gaussians_ndc = predictor(image_resized_pt, disparity_factor)
 
-    LOGGER.info("Running postprocessing.")
+    LOGGER.info("Running postprocessing (means_only=%s).", means_only)
     intrinsics = (
         torch.tensor(
             [
@@ -200,7 +222,11 @@ def predict_image(
 
     # Convert Gaussians to metrics space.
     gaussians = unproject_gaussians(
-        gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
+        gaussians_ndc,
+        torch.eye(4).to(device),
+        intrinsics_resized,
+        internal_shape,
+        means_only=means_only,
     )
 
     return gaussians
